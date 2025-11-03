@@ -1,0 +1,280 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Serverless Financial News Analysis System with Amazon Bedrock
+
+Globals:
+  Api:
+    Cors:
+      AllowOrigin: "'*'"
+      AllowHeaders: "'Content-Type'"
+      AllowMethods: "'GET,POST,OPTIONS'"
+  Function:
+    Timeout: 300
+    Runtime: python3.11
+    MemorySize: 512
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref NewsTable
+
+Resources:
+  # DynamoDB Table for storing news articles
+  NewsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: FinancialNewsArticles
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      AttributeDefinitions:
+        - AttributeName: articleId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: articleId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: TimestampIndex
+          KeySchema:
+            - AttributeName: timestamp
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  # Lambda: News Ingestion
+  NewsIngestionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: NewsIngestion
+      CodeUri: src/news_ingestion/
+      Handler: lambda_function.handler
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref NewsTable
+      Events:
+        ScheduledEvent:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Enabled: true
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /ingest
+            Method: post
+            # No Auth specified = public endpoint (no authentication required)
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref NewsTable
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - ssm:GetParameter
+                - ssm:GetParameters
+              Resource:
+                - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/financial-news/news-api-key'
+                - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/financial-news/alphavantage-api-key'
+
+  # Lambda: Bedrock Analysis
+  BedrockAnalysisFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: BedrockAnalysis
+      CodeUri: src/bedrock_analysis/
+      Handler: lambda_function.handler
+      Timeout: 900
+      MemorySize: 2048
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref NewsTable
+          CONNECTIONS_TABLE_NAME: !Ref ConnectionsTable
+          WS_API_ENDPOINT: !Sub 'wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+          WS_API_ID: !Ref WebSocketApi
+          BEDROCK_REGION: !Ref AWS::Region
+      Events:
+        StreamEvent:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt NewsTable.StreamArn
+            StartingPosition: LATEST
+            BatchSize: 5
+            MaximumBatchingWindowInSeconds: 10
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref NewsTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref NewsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref ConnectionsTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref ConnectionsTable
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - execute-api:ManageConnections
+              Resource: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*'
+
+  # Lambda: WebSocket Connection Handler
+  WebSocketConnectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: WebSocketConnect
+      CodeUri: src/websocket_connect/
+      Handler: lambda_function.handler
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE_NAME: !Ref ConnectionsTable
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref ConnectionsTable
+
+  # Lambda: WebSocket Disconnect Handler
+  WebSocketDisconnectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: WebSocketDisconnect
+      CodeUri: src/websocket_disconnect/
+      Handler: lambda_function.handler
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE_NAME: !Ref ConnectionsTable
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref ConnectionsTable
+
+  # Lambda: WebSocket Message Handler
+  WebSocketMessageFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: WebSocketMessage
+      CodeUri: src/websocket_message/
+      Handler: lambda_function.handler
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref NewsTable
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref NewsTable
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - execute-api:ManageConnections
+              Resource: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*'
+
+  # WebSocket API Gateway
+  WebSocketApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: FinancialNewsWebSocket
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: $request.body.action
+      DisableExecuteApiEndpoint: false
+
+  WebSocketApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref WebSocketApi
+      StageName: prod
+      AutoDeploy: true
+
+  WebSocketConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $connect
+      Target: !Sub 'integrations/${WebSocketConnectIntegration}'
+
+  WebSocketConnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WebSocketConnectFunction.Arn}/invocations'
+
+  WebSocketDisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $disconnect
+      Target: !Sub 'integrations/${WebSocketDisconnectIntegration}'
+
+  WebSocketDisconnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WebSocketDisconnectFunction.Arn}/invocations'
+
+  WebSocketMessageRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $default
+      Target: !Sub 'integrations/${WebSocketMessageIntegration}'
+
+  WebSocketMessageIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WebSocketMessageFunction.Arn}/invocations'
+
+  # Connections Table for WebSocket
+  ConnectionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: WebSocketConnections
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: connectionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: connectionId
+          KeyType: HASH
+
+  # Lambda: Get News (REST API)
+  GetNewsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: GetNews
+      CodeUri: src/get_news/
+      Handler: lambda_function.handler
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref NewsTable
+      Events:
+        GetNews:
+          Type: Api
+          Properties:
+            Path: /news
+            Method: get
+        GetNewsById:
+          Type: Api
+          Properties:
+            Path: /news/{articleId}
+            Method: get
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref NewsTable
+
+
+  # Parameter for News API Key (can be set via SSM or environment)
+  # Note: Set NEWS_API_KEY environment variable or SSM parameter /financial-news/news-api-key
+
+Outputs:
+  WebSocketApiEndpoint:
+    Description: WebSocket API endpoint
+    Value: !Sub 'wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+  RestApiEndpoint:
+    Description: REST API endpoint
+    Value: !GetAtt ServerlessRestApi.RestApiId
+    # Note: After deployment, construct URL manually:
+    # https://<api-id>.execute-api.<region>.amazonaws.com/prod
+
